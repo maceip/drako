@@ -41,10 +41,10 @@ jobs:
           echo "33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/google-gdk-license"
           echo "e9acab5b5fbb560a72cfaecce8946896ff6aab9d" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
 
-          # Install SDK 35 and NDK 27
+          # Install SDK 36 and NDK 27
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --channel=3 \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
             "ndk;27.0.12077973"
 
       - name: Cache Gradle packages
