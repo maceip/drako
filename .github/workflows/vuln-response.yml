@@ -1,0 +1,223 @@
+name: Vulnerability Response
+
+on:
+  # Triggers when Dependabot creates an alert
+  dependabot_alert:
+    types: [created]
+
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      cve_id:
+        description: 'CVE ID to simulate'
+        required: true
+      package:
+        description: 'Affected package (group:artifact)'
+        required: true
+      severity:
+        description: 'Severity level'
+        type: choice
+        options: [CRITICAL, HIGH]
+        default: CRITICAL
+
+permissions:
+  contents: write
+  security-events: read
+
+jobs:
+  assess:
+    runs-on: ubuntu-latest
+    outputs:
+      is_critical: ${{ steps.check.outputs.is_critical }}
+      cve_id: ${{ steps.check.outputs.cve_id }}
+      package: ${{ steps.check.outputs.package }}
+      severity: ${{ steps.check.outputs.severity }}
+      affected_releases: ${{ steps.find.outputs.affected }}
+      has_patch: ${{ steps.check.outputs.has_patch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get alert details
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger
+            echo "cve_id=${{ inputs.cve_id }}" >> $GITHUB_OUTPUT
+            echo "package=${{ inputs.package }}" >> $GITHUB_OUTPUT
+            echo "severity=${{ inputs.severity }}" >> $GITHUB_OUTPUT
+            if [ "${{ inputs.severity }}" = "CRITICAL" ]; then
+              echo "is_critical=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_critical=false" >> $GITHUB_OUTPUT
+            fi
+            echo "has_patch=unknown" >> $GITHUB_OUTPUT
+          else
+            # Dependabot alert
+            ALERT=$(gh api /repos/${{ github.repository }}/dependabot/alerts --jq '.[0]')
+            SEVERITY=$(echo "$ALERT" | jq -r '.security_advisory.severity')
+            CVE=$(echo "$ALERT" | jq -r '.security_advisory.cve_id // .security_advisory.ghsa_id')
+            PKG=$(echo "$ALERT" | jq -r '.dependency.package.name')
+
+            echo "cve_id=$CVE" >> $GITHUB_OUTPUT
+            echo "package=$PKG" >> $GITHUB_OUTPUT
+            echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+
+            # Only proceed for critical
+            if [ "$SEVERITY" = "critical" ]; then
+              echo "is_critical=true" >> $GITHUB_OUTPUT
+            else
+              echo "is_critical=false" >> $GITHUB_OUTPUT
+              echo "Skipping non-critical alert: $SEVERITY"
+            fi
+
+            # Check if patch exists
+            PATCHED=$(echo "$ALERT" | jq -r '.security_advisory.patched_versions // empty')
+            if [ -n "$PATCHED" ]; then
+              echo "has_patch=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_patch=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Find affected releases
+        if: steps.check.outputs.is_critical == 'true'
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PACKAGE="${{ steps.check.outputs.package }}"
+          AFFECTED=""
+
+          # Get all releases
+          RELEASES=$(gh release list --json tagName,url -q '.[] | .tagName')
+
+          for TAG in $RELEASES; do
+            # Download SBOM from release
+            gh release download "$TAG" --pattern "sbom.json" -D /tmp --clobber 2>/dev/null || continue
+
+            # Check if package exists in SBOM
+            if grep -q "\"name\": \"${PACKAGE##*:}\"" /tmp/sbom.json 2>/dev/null; then
+              AFFECTED="$AFFECTED $TAG"
+            fi
+          done
+
+          echo "affected=${AFFECTED}" >> $GITHUB_OUTPUT
+          echo "Affected releases: $AFFECTED"
+
+  respond:
+    needs: assess
+    if: needs.assess.outputs.is_critical == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update affected releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CVE="${{ needs.assess.outputs.cve_id }}"
+          PKG="${{ needs.assess.outputs.package }}"
+          SEVERITY="${{ needs.assess.outputs.severity }}"
+          HAS_PATCH="${{ needs.assess.outputs.has_patch }}"
+          AFFECTED="${{ needs.assess.outputs.affected_releases }}"
+
+          # Build warning banner
+          if [ "$HAS_PATCH" = "true" ]; then
+            BANNER="
+          ---
+          > **SECURITY NOTICE**
+          >
+          > \`$PKG\` affected by [$CVE](https://nvd.nist.gov/vuln/detail/$CVE)
+          >
+          > Severity: **$SEVERITY** | Status: Patch available
+          >
+          > Upgrade to latest release for fix.
+          ---
+          "
+          else
+            BANNER="
+          ---
+          > **SECURITY ADVISORY**
+          >
+          > \`$PKG\` affected by [$CVE](https://nvd.nist.gov/vuln/detail/$CVE)
+          >
+          > Severity: **$SEVERITY** | Status: Awaiting upstream patch
+          >
+          > No fix available. Monitor upstream for updates.
+          ---
+          "
+          fi
+
+          # Update each affected release
+          for TAG in $AFFECTED; do
+            echo "Updating release: $TAG"
+
+            # Get current body
+            CURRENT_BODY=$(gh release view "$TAG" --json body -q '.body')
+
+            # Skip if already has this CVE
+            if echo "$CURRENT_BODY" | grep -q "$CVE"; then
+              echo "Release $TAG already has $CVE notice, skipping"
+              continue
+            fi
+
+            # Prepend banner
+            NEW_BODY="${BANNER}
+
+          ${CURRENT_BODY}"
+
+            # Update release
+            gh release edit "$TAG" --notes "$NEW_BODY"
+            echo "Updated $TAG with security notice"
+          done
+
+      - name: Create tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CVE="${{ needs.assess.outputs.cve_id }}"
+          PKG="${{ needs.assess.outputs.package }}"
+          HAS_PATCH="${{ needs.assess.outputs.has_patch }}"
+          AFFECTED="${{ needs.assess.outputs.affected_releases }}"
+
+          # Check if issue already exists
+          EXISTING=$(gh issue list --search "$CVE in:title" --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #$EXISTING already exists for $CVE"
+            exit 0
+          fi
+
+          if [ "$HAS_PATCH" = "true" ]; then
+            BODY="Patch available. Update \`$PKG\` to remediate.
+
+          **Affected releases:** $AFFECTED
+
+          **Action:** Update dependency and create new release."
+          else
+            BODY="No patch available yet.
+
+          **Affected releases:** $AFFECTED
+
+          **Action:** Monitor upstream for fix. Consider temporary mitigations."
+          fi
+
+          gh issue create \
+            --title "Security: $CVE in $PKG" \
+            --body "$BODY" \
+            --label "security"
+
+      - name: Summary
+        run: |
+          echo "## Vulnerability Response Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**CVE:** ${{ needs.assess.outputs.cve_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Package:** ${{ needs.assess.outputs.package }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Severity:** ${{ needs.assess.outputs.severity }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Affected:** ${{ needs.assess.outputs.affected_releases }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Patch Available:** ${{ needs.assess.outputs.has_patch }}" >> $GITHUB_STEP_SUMMARY

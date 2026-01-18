@@ -1,0 +1,11 @@
+# Dependabot as canary only - no PRs, no commits
+# Alerts are enabled at repo level (Settings > Security > Dependabot alerts)
+
+version: 2
+updates:
+  # Disable all automatic PRs - we only want alerts
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 0  # No PRs - alert only
