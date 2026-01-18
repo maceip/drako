@@ -1,0 +1,496 @@
+name: Build, SBOM & Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  ANDROID_COMPILE_SDK: 36
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  NDK_VERSION: "26.3.11579264"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for version detection
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+          packages: |
+            platforms;android-${{ env.ANDROID_COMPILE_SDK }}
+            build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+            ndk;${{ env.NDK_VERSION }}
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Generate Gradle Dependency Report
+        run: |
+          ./gradlew app:dependencies --configuration releaseRuntimeClasspath > dependencies-full.txt 2>&1 || true
+          ./gradlew app:dependencies --configuration debugRuntimeClasspath >> dependencies-full.txt 2>&1 || true
+
+      - name: Setup Python for SBOM Analysis
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests matplotlib pandas
+
+      - name: Generate SBOM and Staleness Analysis
+        run: |
+          cat << 'PYTHON_SCRIPT' > generate_sbom.py
+          import json
+          import re
+          import requests
+          from datetime import datetime, timedelta
+          from collections import defaultdict
+          import matplotlib.pyplot as plt
+          import matplotlib.dates as mdates
+          import os
+
+          def parse_gradle_dependencies(file_path):
+              """Parse Gradle dependency output to extract dependencies."""
+              deps = {}
+              with open(file_path, 'r') as f:
+                  content = f.read()
+
+              # Pattern to match dependency declarations like: +--- group:artifact:version
+              pattern = r'[+\\]--- ([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+):([0-9a-zA-Z._-]+)'
+              matches = re.findall(pattern, content)
+
+              for group, artifact, version in matches:
+                  key = f"{group}:{artifact}"
+                  # Skip duplicates, keep first occurrence
+                  if key not in deps:
+                      deps[key] = {
+                          'group': group,
+                          'artifact': artifact,
+                          'version': version
+                      }
+
+              return deps
+
+          def get_maven_metadata(group, artifact):
+              """Fetch metadata from Maven Central."""
+              group_path = group.replace('.', '/')
+              url = f"https://repo1.maven.org/maven2/{group_path}/{artifact}/maven-metadata.xml"
+              try:
+                  resp = requests.get(url, timeout=10)
+                  if resp.status_code == 200:
+                      # Parse latest version
+                      latest_match = re.search(r'<latest>([^<]+)</latest>', resp.text)
+                      release_match = re.search(r'<release>([^<]+)</release>', resp.text)
+                      versions_match = re.findall(r'<version>([^<]+)</version>', resp.text)
+
+                      return {
+                          'latest': latest_match.group(1) if latest_match else None,
+                          'release': release_match.group(1) if release_match else None,
+                          'versions': versions_match
+                      }
+              except Exception as e:
+                  pass
+
+              # Try Google Maven
+              url = f"https://dl.google.com/dl/android/maven2/{group_path}/{artifact}/maven-metadata.xml"
+              try:
+                  resp = requests.get(url, timeout=10)
+                  if resp.status_code == 200:
+                      latest_match = re.search(r'<latest>([^<]+)</latest>', resp.text)
+                      release_match = re.search(r'<release>([^<]+)</release>', resp.text)
+                      versions_match = re.findall(r'<version>([^<]+)</version>', resp.text)
+
+                      return {
+                          'latest': latest_match.group(1) if latest_match else None,
+                          'release': release_match.group(1) if release_match else None,
+                          'versions': versions_match
+                      }
+              except Exception:
+                  pass
+
+              return None
+
+          def estimate_version_age(versions, current_version):
+              """Estimate how many versions behind the current version is."""
+              if not versions or current_version not in versions:
+                  return None, None
+
+              try:
+                  idx = versions.index(current_version)
+                  versions_behind = len(versions) - idx - 1
+                  return versions_behind, len(versions)
+              except ValueError:
+                  return None, None
+
+          def main():
+              print("Parsing Gradle dependencies...")
+              deps = parse_gradle_dependencies('dependencies-full.txt')
+              print(f"Found {len(deps)} unique dependencies")
+
+              sbom = {
+                  'bomFormat': 'CycloneDX',
+                  'specVersion': '1.4',
+                  'version': 1,
+                  'metadata': {
+                      'timestamp': datetime.utcnow().isoformat() + 'Z',
+                      'component': {
+                          'type': 'application',
+                          'name': 'drako',
+                          'version': '1.0.0'
+                      }
+                  },
+                  'components': []
+              }
+
+              staleness_data = []
+              update_cadence = defaultdict(list)
+
+              print("Fetching version metadata from Maven repositories...")
+              for i, (key, dep) in enumerate(deps.items()):
+                  print(f"  [{i+1}/{len(deps)}] {key}")
+
+                  metadata = get_maven_metadata(dep['group'], dep['artifact'])
+
+                  component = {
+                      'type': 'library',
+                      'group': dep['group'],
+                      'name': dep['artifact'],
+                      'version': dep['version'],
+                      'purl': f"pkg:maven/{dep['group']}/{dep['artifact']}@{dep['version']}"
+                  }
+
+                  staleness_info = {
+                      'dependency': key,
+                      'current_version': dep['version'],
+                      'latest_version': None,
+                      'versions_behind': None,
+                      'total_versions': None,
+                      'status': 'unknown'
+                  }
+
+                  if metadata:
+                      latest = metadata.get('release') or metadata.get('latest')
+                      if latest:
+                          staleness_info['latest_version'] = latest
+                          component['latestVersion'] = latest
+
+                          if dep['version'] == latest:
+                              staleness_info['status'] = 'up-to-date'
+                          else:
+                              versions_behind, total = estimate_version_age(
+                                  metadata.get('versions', []),
+                                  dep['version']
+                              )
+                              staleness_info['versions_behind'] = versions_behind
+                              staleness_info['total_versions'] = total
+
+                              if versions_behind is not None:
+                                  if versions_behind <= 2:
+                                      staleness_info['status'] = 'slightly-outdated'
+                                  elif versions_behind <= 5:
+                                      staleness_info['status'] = 'outdated'
+                                  else:
+                                      staleness_info['status'] = 'very-outdated'
+                              else:
+                                  staleness_info['status'] = 'outdated'
+
+                          # Track update cadence by group
+                          group_prefix = dep['group'].split('.')[0:2]
+                          group_key = '.'.join(group_prefix) if len(group_prefix) >= 2 else dep['group']
+                          update_cadence[group_key].append({
+                              'artifact': dep['artifact'],
+                              'versions_available': len(metadata.get('versions', [])),
+                              'versions_behind': staleness_info['versions_behind'] or 0
+                          })
+
+                  sbom['components'].append(component)
+                  staleness_data.append(staleness_info)
+
+              # Write SBOM
+              with open('sbom.json', 'w') as f:
+                  json.dump(sbom, f, indent=2)
+              print("Written sbom.json")
+
+              # Write staleness report
+              staleness_report = {
+                  'generated_at': datetime.utcnow().isoformat() + 'Z',
+                  'summary': {
+                      'total_dependencies': len(staleness_data),
+                      'up_to_date': sum(1 for s in staleness_data if s['status'] == 'up-to-date'),
+                      'slightly_outdated': sum(1 for s in staleness_data if s['status'] == 'slightly-outdated'),
+                      'outdated': sum(1 for s in staleness_data if s['status'] == 'outdated'),
+                      'very_outdated': sum(1 for s in staleness_data if s['status'] == 'very-outdated'),
+                      'unknown': sum(1 for s in staleness_data if s['status'] == 'unknown')
+                  },
+                  'dependencies': sorted(staleness_data, key=lambda x: (
+                      {'very-outdated': 0, 'outdated': 1, 'slightly-outdated': 2, 'up-to-date': 3, 'unknown': 4}.get(x['status'], 5),
+                      -(x['versions_behind'] or 0)
+                  ))
+              }
+
+              with open('staleness-report.json', 'w') as f:
+                  json.dump(staleness_report, f, indent=2)
+              print("Written staleness-report.json")
+
+              # Generate update cadence graph
+              print("Generating update cadence graph...")
+
+              fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+              fig.suptitle('Dependency Update Cadence Analysis', fontsize=14, fontweight='bold')
+
+              # 1. Status distribution pie chart
+              ax1 = axes[0, 0]
+              status_counts = staleness_report['summary']
+              labels = ['Up to Date', 'Slightly Outdated', 'Outdated', 'Very Outdated', 'Unknown']
+              sizes = [
+                  status_counts['up_to_date'],
+                  status_counts['slightly_outdated'],
+                  status_counts['outdated'],
+                  status_counts['very_outdated'],
+                  status_counts['unknown']
+              ]
+              colors = ['#2ecc71', '#f1c40f', '#e67e22', '#e74c3c', '#95a5a6']
+              # Filter out zero values
+              non_zero = [(l, s, c) for l, s, c in zip(labels, sizes, colors) if s > 0]
+              if non_zero:
+                  labels, sizes, colors = zip(*non_zero)
+                  ax1.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+              ax1.set_title('Dependency Status Distribution')
+
+              # 2. Versions behind histogram
+              ax2 = axes[0, 1]
+              versions_behind = [s['versions_behind'] for s in staleness_data if s['versions_behind'] is not None]
+              if versions_behind:
+                  ax2.hist(versions_behind, bins=min(20, max(versions_behind) + 1), color='#3498db', edgecolor='black')
+                  ax2.set_xlabel('Versions Behind Latest')
+                  ax2.set_ylabel('Number of Dependencies')
+                  ax2.set_title('Distribution of Version Lag')
+              else:
+                  ax2.text(0.5, 0.5, 'No version data available', ha='center', va='center')
+                  ax2.set_title('Distribution of Version Lag')
+
+              # 3. Top outdated dependencies
+              ax3 = axes[1, 0]
+              outdated = [s for s in staleness_data if s['versions_behind'] is not None and s['versions_behind'] > 0]
+              outdated = sorted(outdated, key=lambda x: -x['versions_behind'])[:10]
+              if outdated:
+                  names = [f"{d['dependency'].split(':')[1][:20]}" for d in outdated]
+                  values = [d['versions_behind'] for d in outdated]
+                  bars = ax3.barh(names, values, color='#e74c3c')
+                  ax3.set_xlabel('Versions Behind')
+                  ax3.set_title('Top 10 Most Outdated Dependencies')
+                  ax3.invert_yaxis()
+              else:
+                  ax3.text(0.5, 0.5, 'All dependencies up to date!', ha='center', va='center')
+                  ax3.set_title('Top 10 Most Outdated Dependencies')
+
+              # 4. Update cadence by ecosystem/group
+              ax4 = axes[1, 1]
+              cadence_summary = {}
+              for group, artifacts in update_cadence.items():
+                  if artifacts:
+                      avg_behind = sum(a['versions_behind'] for a in artifacts) / len(artifacts)
+                      cadence_summary[group] = avg_behind
+
+              if cadence_summary:
+                  sorted_groups = sorted(cadence_summary.items(), key=lambda x: -x[1])[:10]
+                  groups, avg_values = zip(*sorted_groups)
+                  groups = [g[:15] for g in groups]  # Truncate long names
+                  ax4.barh(groups, avg_values, color='#9b59b6')
+                  ax4.set_xlabel('Average Versions Behind')
+                  ax4.set_title('Update Cadence by Dependency Group')
+                  ax4.invert_yaxis()
+              else:
+                  ax4.text(0.5, 0.5, 'No cadence data available', ha='center', va='center')
+                  ax4.set_title('Update Cadence by Dependency Group')
+
+              plt.tight_layout()
+              plt.savefig('update-cadence-graph.png', dpi=150, bbox_inches='tight')
+              print("Written update-cadence-graph.png")
+
+              # Generate markdown summary
+              with open('sbom-summary.md', 'w') as f:
+                  f.write('# SBOM Summary Report\n\n')
+                  f.write(f'Generated: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}\n\n')
+                  f.write('## Overview\n\n')
+                  f.write(f'| Metric | Count |\n')
+                  f.write(f'|--------|-------|\n')
+                  f.write(f'| Total Dependencies | {status_counts["total_dependencies"]} |\n')
+                  f.write(f'| Up to Date | {status_counts["up_to_date"]} |\n')
+                  f.write(f'| Slightly Outdated | {status_counts["slightly_outdated"]} |\n')
+                  f.write(f'| Outdated | {status_counts["outdated"]} |\n')
+                  f.write(f'| Very Outdated | {status_counts["very_outdated"]} |\n')
+                  f.write(f'| Unknown | {status_counts["unknown"]} |\n\n')
+
+                  f.write('## Dependencies Requiring Attention\n\n')
+                  attention_deps = [s for s in staleness_data if s['status'] in ['outdated', 'very-outdated']]
+                  if attention_deps:
+                      f.write('| Dependency | Current | Latest | Versions Behind |\n')
+                      f.write('|------------|---------|--------|----------------|\n')
+                      for dep in sorted(attention_deps, key=lambda x: -(x['versions_behind'] or 0))[:20]:
+                          f.write(f"| {dep['dependency']} | {dep['current_version']} | {dep['latest_version'] or 'N/A'} | {dep['versions_behind'] or 'N/A'} |\n")
+                  else:
+                      f.write('All dependencies are reasonably up to date!\n')
+
+                  f.write('\n## Update Cadence Graph\n\n')
+                  f.write('![Update Cadence](update-cadence-graph.png)\n')
+
+              print("Written sbom-summary.md")
+              print("SBOM generation complete!")
+
+          if __name__ == '__main__':
+              main()
+          PYTHON_SCRIPT
+
+          python generate_sbom.py
+
+      - name: Get next version
+        id: version
+        run: |
+          # Get the latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+
+          # Parse version components
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          # Increment patch version
+          PATCH=$((PATCH + 1))
+
+          # Handle overflow (0.0.99 -> 0.1.0)
+          if [ $PATCH -ge 100 ]; then
+            PATCH=0
+            MINOR=$((MINOR + 1))
+          fi
+
+          if [ $MINOR -ge 100 ]; then
+            MINOR=0
+            MAJOR=$((MAJOR + 1))
+          fi
+
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "version_number=${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
+
+      - name: Find APK
+        id: find_apk
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" -type f | head -1)
+          APK_NAME="drako-${{ steps.version.outputs.new_version }}-debug.apk"
+          cp "$APK_PATH" "$APK_NAME"
+          echo "apk_path=$APK_NAME" >> $GITHUB_OUTPUT
+          echo "Found APK: $APK_NAME"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ steps.find_apk.outputs.apk_path }}
+            sbom.json
+
+      - name: Upload SBOM Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-artifacts
+          path: |
+            sbom.json
+            staleness-report.json
+            sbom-summary.md
+            update-cadence-graph.png
+          retention-days: 90
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          retention-days: 90
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new_version }}
+          name: Release ${{ steps.version.outputs.new_version }}
+          body: |
+            ## Drako ${{ steps.version.outputs.new_version }}
+
+            ### Build Information
+            - **Build Date:** ${{ github.event.head_commit.timestamp }}
+            - **Commit:** ${{ github.sha }}
+            - **Branch:** main
+
+            ### Artifacts
+            - Debug APK
+            - SBOM (Software Bill of Materials)
+            - Dependency Staleness Report
+            - Update Cadence Graph
+
+            ### SBOM Summary
+            See `sbom-summary.md` for a detailed breakdown of dependencies and their update status.
+
+            ---
+            *Automated release by GitHub Actions*
+          files: |
+            ${{ steps.find_apk.outputs.apk_path }}
+            sbom.json
+            staleness-report.json
+            sbom-summary.md
+            update-cadence-graph.png
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Version" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts Generated" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Debug APK" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ SBOM (sbom.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Staleness Report" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Update Cadence Graph" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Attestation" >> $GITHUB_STEP_SUMMARY
+          echo "Build provenance has been attested for APK and SBOM" >> $GITHUB_STEP_SUMMARY
