@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "ai.drako"
-    compileSdk = 35
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "ai.drako"
         minSdk = 33
-        targetSdk = 35
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
