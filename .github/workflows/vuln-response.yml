@@ -136,29 +136,52 @@ jobs:
             fi
           done
 
-      - name: Create/update issue
+  dashboard:
+    needs: [scan, alert]
+    if: needs.scan.outputs.has_critical == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update security dashboard issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ID="${{ matrix.vuln.id }}"
-          PKG="${{ matrix.vuln.pkg }}"
+          VULNS='${{ needs.scan.outputs.vulns }}'
+          DATE=$(date -u +"%Y-%m-%d")
 
-          EXISTING=$(gh issue list --repo ${{ github.repository }} --search "$ID in:title" --json number -q '.[0].number')
+          # Build table
+          TABLE="| CVE | Package | CVSS | Fix |
+          |-----|---------|------|-----|"
 
-          if [ -z "$EXISTING" ]; then
+          echo "$VULNS" | jq -r '.[] | "| [\(.id)](https://osv.dev/vulnerability/\(.id)) | \(.pkg | split("/")[-1] | split("@")[0]) | \(.score) | \(.fixed // "none") |"' | while read line; do
+            TABLE="$TABLE
+          $line"
+          done
+
+          BODY="## Critical Vulnerabilities
+
+          **Last scan:** $DATE
+          **Action required:** Close this issue only after all CVEs are addressed.
+
+          $TABLE
+
+          ---
+          Releases are **blocked** while this issue is open."
+
+          # Find or create dashboard issue
+          ISSUE=$(gh issue list --repo ${{ github.repository }} --label security --state open --search "Critical Vulnerabilities in:title" --json number -q '.[0].number')
+
+          if [ -n "$ISSUE" ]; then
+            gh issue edit "$ISSUE" --repo ${{ github.repository }} --body "$BODY"
+            echo "Updated issue #$ISSUE"
+          else
             gh issue create --repo ${{ github.repository }} \
-              --title "$ID: $PKG" \
-              --body "**Vulnerability:** $ID
-          **Package:** $PKG
-          **CVSS:** ${{ matrix.vuln.score }}
-          **Fixed in:** ${{ matrix.vuln.fixed || 'N/A' }}
-
-          https://osv.dev/vulnerability/$ID" \
+              --title "Critical Vulnerabilities - Action Required" \
+              --body "$BODY" \
               --label "security"
           fi
 
   summary:
-    needs: [scan, alert]
+    needs: [scan]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -166,3 +189,6 @@ jobs:
         run: |
           echo "## Vulnerability Scan" >> $GITHUB_STEP_SUMMARY
           echo "Critical found: ${{ needs.scan.outputs.has_critical }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.scan.outputs.has_critical }}" = "true" ]; then
+            echo "**Releases are blocked until security issues are resolved**" >> $GITHUB_STEP_SUMMARY
+          fi

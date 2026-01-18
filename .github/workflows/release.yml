@@ -10,9 +10,30 @@ permissions:
   contents: write
   id-token: write
   attestations: write
+  issues: read
 
 jobs:
+  security-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      blocked: ${{ steps.check.outputs.blocked }}
+    steps:
+      - name: Check for open critical CVEs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COUNT=$(gh issue list --repo ${{ github.repository }} --label security --state open --json number -q 'length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::Release blocked: $COUNT open security issue(s)"
+            echo "blocked=true" >> $GITHUB_OUTPUT
+            gh issue list --repo ${{ github.repository }} --label security --state open
+            exit 1
+          fi
+          echo "blocked=false" >> $GITHUB_OUTPUT
+
   build-and-release:
+    needs: security-gate
     runs-on: ubuntu-latest
 
     steps:
