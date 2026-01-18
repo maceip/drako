@@ -205,7 +205,7 @@ jobs:
 
               # Modern dark theme graph
               fig = plt.figure(figsize=(16, 10), facecolor=COLORS['bg'])
-              fig.suptitle('📦 Dependency Staleness Report', fontsize=20, fontweight='bold',
+              fig.suptitle('Dependency Staleness Report', fontsize=20, fontweight='bold',
                           color=COLORS['text'], y=0.98)
 
               # Grid layout
@@ -241,15 +241,15 @@ jobs:
               ax2.axis('off')
 
               stats_text = f"""
-              📊 SUMMARY
+              SUMMARY
 
-              Total Dependencies: {summary['total']}
+              Total: {summary['total']}
 
-              ✅ Up to Date: {summary['up_to_date']}
-              ⚠️  Slightly Outdated: {summary['slightly_outdated']}
-              🔶 Outdated: {summary['outdated']}
-              🔴 Very Outdated: {summary['very_outdated']}
-              ❓ Unknown: {summary['unknown']}
+              Up to Date: {summary['up_to_date']}
+              Slight Lag: {summary['slightly_outdated']}
+              Outdated: {summary['outdated']}
+              Critical: {summary['very_outdated']}
+              Unknown: {summary['unknown']}
               """
               ax2.text(0.5, 0.5, stats_text, transform=ax2.transAxes, fontsize=11,
                       color=COLORS['text'], verticalalignment='center',
@@ -289,7 +289,7 @@ jobs:
                   for bar, val in zip(bars, vals):
                       ax4.text(val + 0.3, bar.get_y() + bar.get_height()/2, str(val),
                               va='center', color=COLORS['text'], fontsize=9)
-              ax4.set_title('🔥 Most Outdated Dependencies', color=COLORS['text'], fontsize=12, pad=10)
+              ax4.set_title('Most Outdated Dependencies', color=COLORS['text'], fontsize=12, pad=10)
               ax4.tick_params(colors=COLORS['text'])
               for spine in ax4.spines.values():
                   spine.set_color(COLORS['border'])
@@ -320,24 +320,18 @@ jobs:
                          edgecolor='none', bbox_inches='tight')
               print("Graph saved!")
 
-              # Markdown summary with emoji status
+              # Markdown summary
               health_score = int((summary['up_to_date'] / max(summary['total'], 1)) * 100)
-              health_emoji = "🟢" if health_score >= 80 else "🟡" if health_score >= 50 else "🔴"
 
               with open('sbom-summary.md', 'w') as f:
-                  f.write(f'# 📦 SBOM Health Report\n\n')
-                  f.write(f'**Health Score:** {health_emoji} {health_score}%\n\n')
-                  f.write(f'| Status | Count | % |\n|--------|-------|---|\n')
-                  for status, count, emoji in [
-                      ('Up to Date', summary['up_to_date'], '✅'),
-                      ('Slightly Outdated', summary['slightly_outdated'], '⚠️'),
-                      ('Outdated', summary['outdated'], '🔶'),
-                      ('Very Outdated', summary['very_outdated'], '🔴'),
-                      ('Unknown', summary['unknown'], '❓')
-                  ]:
-                      pct = int(count / max(summary['total'], 1) * 100)
-                      f.write(f'| {emoji} {status} | {count} | {pct}% |\n')
-                  f.write(f'\n**Total Dependencies:** {summary["total"]}\n')
+                  f.write(f'# SBOM Report\n\n')
+                  f.write(f'Health: {health_score}% | Total: {summary["total"]}\n\n')
+                  f.write(f'| Status | Count |\n|--------|-------|\n')
+                  f.write(f'| Up to Date | {summary["up_to_date"]} |\n')
+                  f.write(f'| Slight Lag | {summary["slightly_outdated"]} |\n')
+                  f.write(f'| Outdated | {summary["outdated"]} |\n')
+                  f.write(f'| Critical | {summary["very_outdated"]} |\n')
+                  f.write(f'| Unknown | {summary["unknown"]} |\n')
 
               print("Done!")
 
@@ -393,53 +387,42 @@ jobs:
       - name: Generate release body
         id: release_body
         run: |
-          # Read staleness summary
-          HEALTH=$(python3 -c "import json; d=json.load(open('staleness-report.json')); s=d['summary']; print(int(s['up_to_date']/max(s['total'],1)*100))")
-          TOTAL=$(python3 -c "import json; print(json.load(open('staleness-report.json'))['summary']['total'])")
-          UP_TO_DATE=$(python3 -c "import json; print(json.load(open('staleness-report.json'))['summary']['up_to_date'])")
-          OUTDATED=$(python3 -c "import json; s=json.load(open('staleness-report.json'))['summary']; print(s['outdated']+s['very_outdated'])")
+          python3 << 'PYSCRIPT'
+          import json
 
-          if [ "$HEALTH" -ge 80 ]; then EMOJI="🟢"; elif [ "$HEALTH" -ge 50 ]; then EMOJI="🟡"; else EMOJI="🔴"; fi
+          d = json.load(open('staleness-report.json'))
+          s = d['summary']
+          total = s['total']
+          health = int(s['up_to_date'] / max(total, 1) * 100)
 
-          cat << EOF > release-body.md
-          ## 🐉 Drako ${{ steps.version.outputs.new_version }}
+          # Create ASCII sparkline bar
+          def sparkbar(val, max_val, width=20):
+              filled = int((val / max(max_val, 1)) * width)
+              return '█' * filled + '░' * (width - filled)
 
-          | | |
-          |---|---|
-          | **Commit** | \`${{ github.sha }}\` |
-          | **Date** | $(date -u +"%Y-%m-%d %H:%M UTC") |
+          # Build minimal release body
+          body = f"""### ${{ steps.version.outputs.new_version }}
 
-          ---
-
-          ### 📦 Dependency Health Report
-
-          **Health Score:** ${EMOJI} **${HEALTH}%**
-
-          | Metric | Value |
-          |--------|-------|
-          | Total Dependencies | ${TOTAL} |
-          | ✅ Up to Date | ${UP_TO_DATE} |
-          | ⚠️ Need Updates | ${OUTDATED} |
-
-          <details>
-          <summary>📊 Staleness Visualization</summary>
-
-          ![Dependency Staleness Report](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.new_version }}/update-cadence-graph.png)
-
-          </details>
+          \`${{ github.sha }}\`
 
           ---
 
-          ### 📥 Downloads
-          - **APK:** \`drako-${{ steps.version.outputs.new_version }}-debug.apk\`
-          - **SBOM:** \`sbom.json\` (CycloneDX format)
-          - **Full Report:** \`staleness-report.json\`
+          **Dependencies** {total} | **Health** {health}%
 
-          ---
-          *Automated release by GitHub Actions* 🤖
-          EOF
+          ```
+          Up to date   {sparkbar(s['up_to_date'], total)} {s['up_to_date']}
+          Slight lag   {sparkbar(s['slightly_outdated'], total)} {s['slightly_outdated']}
+          Outdated     {sparkbar(s['outdated'], total)} {s['outdated']}
+          Critical     {sparkbar(s['very_outdated'], total)} {s['very_outdated']}
+          Unknown      {sparkbar(s['unknown'], total)} {s['unknown']}
+          ```
 
-          echo "body_file=release-body.md" >> $GITHUB_OUTPUT
+          ![staleness](https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.new_version }}/update-cadence-graph.png)
+          """
+
+          with open('release-body.md', 'w') as f:
+              f.write(body)
+          PYSCRIPT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
