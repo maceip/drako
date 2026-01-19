@@ -8,6 +8,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -276,18 +277,12 @@ private fun PermissionScreen(
 @Composable
 private fun GlowOrb() {
     val transition = rememberInfiniteTransition(label = "glow")
-    val rotation by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(3000, easing = LinearEasing)),
-        label = "rotation"
-    )
     val pulse by transition.animateFloat(
         initialValue = 0.6f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
             tween(1500, easing = LinearEasing),
-            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+            repeatMode = RepeatMode.Reverse
         ),
         label = "pulse"
     )
@@ -299,21 +294,18 @@ private fun GlowOrb() {
             .drawWithCache {
                 val strokeWidth = 4.dp.toPx()
                 onDrawBehind {
-                    val angle = rotation / 360f
-
-                    // Animated glow ring
+                    // Outer glow ring
                     drawCircle(
-                        brush = Brush.sweepGradient(
-                            (angle - 0.15f) to Color.Transparent,
-                            (angle - 0.05f) to Color.Cyan.copy(alpha = 0.4f),
-                            angle to Color.Cyan,
-                            (angle + 0.05f) to Color.Cyan.copy(alpha = 0.4f),
-                            (angle + 0.15f) to Color.Transparent
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                Color.Cyan.copy(alpha = 0.6f),
+                                Color.Cyan.copy(alpha = 0.2f)
+                            )
                         ),
                         style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
                     )
 
-                    // Static inner ring
+                    // Inner ring
                     drawCircle(
                         color = Color.Cyan.copy(alpha = 0.2f),
                         style = Stroke(width = 2.dp.toPx())
